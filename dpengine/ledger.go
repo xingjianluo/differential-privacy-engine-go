@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"time"
 )
 
 // Composition describes how the privacy cost of a query is combined with
@@ -46,13 +47,40 @@ type Ledger struct {
 	// replay: a repeated request returns its original record and is
 	// never charged twice.
 	processed map[string]Consumption
+	// reservations maps batchID -> batch hold (all lifecycle states).
+	reservations map[string]*Reservation
+	// now is the ledger clock; overridable in tests for deterministic
+	// expiry semantics.
+	now func() time.Time
 }
 
 func NewLedger() *Ledger {
 	return &Ledger{
-		datasets:  make(map[string]*Dataset),
-		processed: make(map[string]Consumption),
+		datasets:     make(map[string]*Dataset),
+		processed:    make(map[string]Consumption),
+		reservations: make(map[string]*Reservation),
+		now:          time.Now,
 	}
+}
+
+// withClock returns a ledger using the given clock (tests only).
+func withClock(now func() time.Time) *Ledger {
+	l := NewLedger()
+	l.now = now
+	return l
+}
+
+// reservedOf returns the total epsilon currently held by pending
+// (not yet settled and not reclaimed) reservations of a dataset. Caller
+// must hold l.mu.
+func (l *Ledger) reservedOf(ds *Dataset) float64 {
+	var sum float64
+	for _, r := range l.reservations {
+		if r.Dataset == ds.Name && r.Status == ReservationPending {
+			sum += r.Amount
+		}
+	}
+	return sum
 }
 
 // AddDataset registers a dataset with a total epsilon budget.
@@ -110,10 +138,13 @@ func (l *Ledger) Consume(dataset, requestID string, epsilon float64, comp Compos
 	case ParallelComposition:
 		newSpent = math.Max(ds.SpentEpsilon, epsilon)
 	}
-	if newSpent > ds.TotalEpsilon {
+	// Pending reservations are already unavailable, so a direct consume
+	// can never push the (spent + held) total beyond the budget.
+	reserved := l.reservedOf(ds)
+	if newSpent+reserved > ds.TotalEpsilon {
 		return Consumption{}, newError(ReasonBudgetExhausted,
-			fmt.Sprintf("dataset %q: need spent=%.6f but budget=%.6f (already spent %.6f)",
-				dataset, newSpent, ds.TotalEpsilon, ds.SpentEpsilon))
+			fmt.Sprintf("dataset %q: need spent=%.6f reserved=%.6f but budget=%.6f (already spent %.6f)",
+				dataset, newSpent, reserved, ds.TotalEpsilon, ds.SpentEpsilon))
 	}
 
 	c := Consumption{

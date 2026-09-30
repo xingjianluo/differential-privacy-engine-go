@@ -13,6 +13,8 @@ const (
 	ReasonUnboundedInput   Reason = "unbounded_input"
 	ReasonVersionMismatch  Reason = "version_incompatible"
 	ReasonCorruptSnapshot  Reason = "corrupt_snapshot"
+	ReasonBatchNotFound    Reason = "batch_not_found"
+	ReasonInvalidState     Reason = "invalid_state"
 )
 
 // Error is the single error type returned by the engine. Reason is always
