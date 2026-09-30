@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"time"
 )
 
 // Composition describes how the privacy cost of a query is combined with
@@ -21,10 +22,11 @@ const (
 
 // Dataset is the privacy-budget account of one dataset.
 type Dataset struct {
-	Name          string
-	TotalEpsilon  float64
-	SpentEpsilon  float64
-	ConsumedUnits []Consumption
+	Name            string
+	TotalEpsilon    float64
+	SpentEpsilon    float64
+	ReservedEpsilon float64
+	ConsumedUnits   []Consumption
 }
 
 // Consumption is one immutable, auditable budget-consumption record.
@@ -46,12 +48,23 @@ type Ledger struct {
 	// replay: a repeated request returns its original record and is
 	// never charged twice.
 	processed map[string]Consumption
+	// reservations maps batchID -> reservation for the reserve /
+	// confirm / release / expire workflow.
+	reservations map[string]*Reservation
+	// batchEvents is the append-only audit trail of batch lifecycle
+	// transitions (reserve / confirm / release / expire).
+	batchEvents []BatchEvent
+	// now supplies the current time; overridable in tests so expiry
+	// sweeps are deterministic.
+	now func() time.Time
 }
 
 func NewLedger() *Ledger {
 	return &Ledger{
-		datasets:  make(map[string]*Dataset),
-		processed: make(map[string]Consumption),
+		datasets:     make(map[string]*Dataset),
+		processed:    make(map[string]Consumption),
+		reservations: make(map[string]*Reservation),
+		now:          time.Now,
 	}
 }
 
@@ -110,10 +123,13 @@ func (l *Ledger) Consume(dataset, requestID string, epsilon float64, comp Compos
 	case ParallelComposition:
 		newSpent = math.Max(ds.SpentEpsilon, epsilon)
 	}
-	if newSpent > ds.TotalEpsilon {
+	// Open reservations hold their budget: any other charge — including
+	// the single-query path — must stay within Total minus the held
+	// amount, so spent + reserved never exceeds Total.
+	if newSpent+ds.ReservedEpsilon > ds.TotalEpsilon {
 		return Consumption{}, newError(ReasonBudgetExhausted,
-			fmt.Sprintf("dataset %q: need spent=%.6f but budget=%.6f (already spent %.6f)",
-				dataset, newSpent, ds.TotalEpsilon, ds.SpentEpsilon))
+			fmt.Sprintf("dataset %q: need spent=%.6f but budget=%.6f (already spent %.6f, reserved %.6f)",
+				dataset, newSpent, ds.TotalEpsilon, ds.SpentEpsilon, ds.ReservedEpsilon))
 	}
 
 	c := Consumption{
