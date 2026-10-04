@@ -116,6 +116,11 @@ func (l *Ledger) Consume(dataset, requestID string, epsilon float64, comp Compos
 		return Consumption{}, newError(ReasonDatasetNotFound, "no such dataset: "+dataset)
 	}
 
+	// Overdue reservations must not pin budget forever: whether or not
+	// anybody ran ExpireReservations, holds past their deadline are
+	// reclaimed here before capacity is judged.
+	l.reclaimExpiredLocked(dataset, l.now())
+
 	var newSpent float64
 	switch comp {
 	case SequentialComposition:
@@ -123,9 +128,9 @@ func (l *Ledger) Consume(dataset, requestID string, epsilon float64, comp Compos
 	case ParallelComposition:
 		newSpent = math.Max(ds.SpentEpsilon, epsilon)
 	}
-	// Open reservations hold their budget: any other charge — including
-	// the single-query path — must stay within Total minus the held
-	// amount, so spent + reserved never exceeds Total.
+	// Only live (not-yet-due) reservations hold budget: any other charge
+	// — including the single-query path — must stay within Total minus
+	// the held amount, so spent + reserved never exceeds Total.
 	if newSpent+ds.ReservedEpsilon > ds.TotalEpsilon {
 		return Consumption{}, newError(ReasonBudgetExhausted,
 			fmt.Sprintf("dataset %q: need spent=%.6f but budget=%.6f (already spent %.6f, reserved %.6f)",

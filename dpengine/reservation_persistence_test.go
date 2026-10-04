@@ -40,6 +40,9 @@ func TestSnapshotRestoresOpenReservation(t *testing.T) {
 	}
 
 	r := snapshotRoundTrip(t, l)
+	// Restored ledgers default to wall-clock time; pin the clock back to
+	// the crash instant so the open hold (deadline base+5m) is alive.
+	r.now = func() time.Time { return base }
 
 	view, _ := r.Budget("ds")
 	t.Logf("input: restart with spent=2 open=3 confirmed(done=.5) -> spent=%.1f reserved=%.1f available=%.1f",

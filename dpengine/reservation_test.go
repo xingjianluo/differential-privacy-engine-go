@@ -29,11 +29,12 @@ func TestReserveConfirmSettlement(t *testing.T) {
 	t.Logf("input: reserve batch-1 eps=4 -> status=%s expiresIn=%v", r.Status, time.Until(r.ExpiresAt).Round(time.Second))
 
 	view, _ := l.Budget("ds")
-	if view.Spent != 0 || view.Reserved != 4 || view.Available != 6 || view.Releasable != 4 {
+	if view.Spent != 0 || view.Reserved != 4 || view.Available != 6 ||
+		view.Releasable != 0 || view.Expired != 0 {
 		t.Fatalf("unexpected view after reserve: %+v", view)
 	}
-	t.Logf("view: total=%.1f spent=%.1f reserved=%.1f releasable=%.1f available=%.1f",
-		view.Total, view.Spent, view.Reserved, view.Releasable, view.Available)
+	t.Logf("view: total=%.1f spent=%.1f reserved=%.1f releasable=%.1f expired=%.1f available=%.1f",
+		view.Total, view.Spent, view.Reserved, view.Releasable, view.Expired, view.Available)
 
 	// Hold is immediately unavailable to other requests.
 	if _, err := l.Consume("ds", "other", 6.000001, SequentialComposition); err == nil {
@@ -56,7 +57,8 @@ func TestReserveConfirmSettlement(t *testing.T) {
 		t.Fatalf("confirm mismatch: %+v", got)
 	}
 	view, _ = l.Budget("ds")
-	if view.Spent != 2.5 || view.Reserved != 0 || view.Available != 7.5 || view.Releasable != 0 {
+	if view.Spent != 2.5 || view.Reserved != 0 || view.Available != 7.5 ||
+		view.Releasable != 0 || view.Expired != 0 {
 		t.Fatalf("view after confirm: %+v", view)
 	}
 	t.Logf("input: confirm batch-1 actual=2.5 -> spent=%.1f reserved=%.1f available=%.1f",
@@ -391,14 +393,17 @@ func TestExpireReservationsSweep(t *testing.T) {
 	t.Logf("input: t+60s sweep -> expired=%s reserved=%.1f available=%.1f",
 		got[0].BatchID, view.Reserved, view.Available)
 
-	// Expired batch is terminal: confirm/release rejected, sweep idempotent.
+	// Expired batch is terminal: confirm/release rejected as expired,
+	// sweep idempotent.
 	if _, err := l.Confirm("short", 1.0); err == nil {
 		t.Fatal("confirm of expired batch must be rejected")
 	} else {
-		wantReason(t, err, ReasonInvalidState, "confirm expired batch")
+		wantReason(t, err, ReasonReservationExpired, "confirm swept-expired batch")
 	}
 	if _, err := l.Release("short"); err == nil {
 		t.Fatal("release of expired batch must be rejected")
+	} else {
+		wantReason(t, err, ReasonReservationExpired, "release swept-expired batch")
 	}
 	got2, _ := l.ExpireReservations()
 	if len(got2) != 0 {

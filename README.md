@@ -85,12 +85,15 @@ if success {
 |---|---|
 | `Total` | 数据集总预算 |
 | `Spent` | 已结算消耗（单调不减，永不回落） |
-| `Reserved` | 未结算预占中、对他人不可用的额度 |
-| `Releasable` | 可通过释放/过期回收的额度（纯预占模型下等于 `Reserved`） |
-| `Available` | 当前立即可申请：`Total - Spent - Reserved` |
+| `Reserved` | **未到期**预占中、对他人真实不可用的额度 |
+| `Releasable` | 已过截止时间但尚未被回收动作物化的过期持有额（`Expired` 是它的同义字段）；这笔额度**已计入** `Available`，在需要额度时会被自动收回 |
+| `Expired` | 同 `Releasable`：已过期、等待（或即将被惰性）回收的部分 |
+| `Available` | 当前立即可申请：`Total - Spent - Reserved`（只扣未到期占用，过期持有额不挡新请求） |
 
-任何路径、任何时刻都保持不变式 **`Spent + Reserved ≤ Total`**：直接扣费
-会把预占额算进占用，确认时 `actualEps` 不得超过预占额，因此总消耗永远
+三个互斥类别恒等划分总预算：**`Total = Spent + Reserved + Available`**，
+其中 `Releasable/Expired ⊆ Available`；任何路径、任何时刻都保持不变式
+**`Spent + Reserved ≤ Total`**：直接扣费与新预占都会先把过期持有额收回、
+再按未到期占用做检查，确认时 `actualEps` 不得超过预占额，因此总消耗永远
 不会超过预算。
 
 ### 生命周期与“只生效一次”
@@ -98,9 +101,10 @@ if success {
 ```
 reserve ──► reserved ──► confirmed   （actualEps 入 Spent，差额回 Available）
                     │
-                    ├──► released    （全额释放，Spent 不变）
+                    ├──► released    （到期前取消，全额释放，Spent 不变）
                     │
-                    └──► expired     （被过期回收，全额回 Available）
+                    └──► expired     （到 ExpiresAt 即过期；由显式扫描或
+                                       需要额度时的惰性回收物化，全额回池）
 ```
 
 - **预占**：同一 `BatchID` 重复 `Reserve` 是幂等重放，返回当前状态，绝不
@@ -115,31 +119,49 @@ reserve ──► reserved ──► confirmed   （actualEps 入 Spent，差额
   和状态错误明确区分。
 - 每次 reserve/confirm/release/expire 都向批次审计轨迹追加一条
   `BatchEvent`（批次、数据集、目标状态、金额、时间），可通过
-  `ledger.BatchHistory()` 获取，且该轨迹随快照持久化。
+  `ledger.BatchHistory()` 获取，且该轨迹随快照持久化；无论过期是被扫描
+  物化还是被惰性回收，都只有一条 expire 事件。
 
-### 过期回收语义
+### 过期语义：截止时间是唯一判据
 
-- 预占时通过 TTL 确定 `ExpiresAt = 申请时刻 + TTL`。回收由**显式调用**
-  `ledger.ExpireReservations()` 驱动（确定性、可审计，不依赖后台 goroutine
-  或定时器）：所有 `ExpiresAt ≤ 当前时间` 仍为 `reserved` 的预占被回收，
-  全额回到 `Available`，批次变为终态 `expired`，并按 `BatchID` 排序逐条
-  追加过期事件。
-- 截止时刻即到期（`now ≥ ExpiresAt`）；重复扫描是幂等的，已结算批次永远
-  不会被回收。
-- 调用方可周期性调用该方法（如请求入口或定时任务）。时钟来自账本内部的
-  `now`（生产环境为 `time.Now`，测试可替换为固定时钟），因此过期行为
-  完全可复现。
+- 预占时通过 TTL 确定 `ExpiresAt = 申请时刻 + TTL`。**一旦当前时间
+  `now ≥ ExpiresAt`，该预占在语义上就已经过期**——这与“有没有谁刚好跑过
+  一次回收扫描”完全无关：
+  - 过期之后再 `Confirm`（哪怕确认金额 ≤ 预占额）或 `Release` 一律失败，
+    返回专用错误 `reservation_expired`，绝不会把实际消耗记进 `Spent`；
+    该错误与 `batch_not_found`（批次不存在）、`invalid_state`（未过期但已
+    结算）、`budget_exhausted`（未过期但超占）明确区分。
+  - `GetReservation` 对过期批次返回 `expired` 状态；`Budget` 视图把
+    过期未物化的持有额放在 `Releasable/Expired`，不计入 `Reserved`。
+- **过期额度自动回收复用（无需任何后台动作）**：长期无人结算的预占不会
+  把额度占死——新的 `Reserve` 或直接 `Consume` 在判定额度前，会先把相关
+  数据集所有已到截止时间的持有额收回；因此“没人触发回收”时过期部分照样
+  能被新请求使用。`ExpireReservations()` 作为**可选的显式扫描**仍然保留：
+  它一次性物化所有到期预占（按 `BatchID` 排序、逐条追加过期事件），适合
+  周期任务或在监控/对账时调用；重复扫描幂等，已结算批次永不被回收。
+- **回收只生效一次**：显式扫描与惰性回收走的是同一段物化逻辑，只对仍为
+  `reserved` 的批次生效。批次要么被结算（金额入 `Spent`、差额回池），
+  要么被过期回收（全额回池），不可能既计实际消耗、又把同一笔额度放回池
+  子；并发下“确认 vs 回收”相撞时，锁序决定谁先发生，但两者合计只有一次
+  终态效果。
+- 截止时刻即到期；时钟来自账本内部的 `now`（生产环境为 `time.Now`，测试
+  可替换为固定时钟），因此过期行为完全可复现。重启不改变截止时间：恢复
+  后 `now ≥ ExpiresAt` 的批次同样只按截止时间判定为过期，无需崩溃前跑过
+  扫描。
 
 ## 预占状态的持久化与重启恢复
 
 预占记录、批次状态与批次审计轨迹随快照一起持久化（快照版本 **v2**）：
 
-- **未决预占不丢**：重启后处于 `reserved` 的批次仍为 `reserved`，占用额
-  照旧计入 `Reserved`，不会被重复占用（重放 `Reserve` 仍幂等），也不会
-  被凭空释放；`ExpiresAt` 原样恢复，重启后继续受同一条过期规则约束，
-  扫描到点即可回收。
+- **未决预占不丢**：重启后处于 `reserved` 的批次原样恢复，占用额照旧计入
+  账本合计，不会被重复占用（重放 `Reserve` 仍幂等），也不会被凭空释放；
+  `ExpiresAt` 原样恢复，重启后继续受**同一条截止时间规则**约束——恢复时
+  已过截止时间的批次立即按过期对待（拒绝 confirm/release 为
+  `reservation_expired`、新申请需要额度时惰性收回），无需崩溃前曾扫描到
+  点；尚未到期的扫描到点后照常回收。
 - **不会结算两次**：终态（confirmed/released/expired）随快照保留，重启后
-  再 confirm/release 仍是 `invalid_state`。
+  再 confirm/release 仍按 `reservation_expired` / `invalid_state` 拒绝；
+  过期物化（扫描或惰性）始终只有一次、只追加一条 expire 事件。
 - **恢复即校验**：加载 v2 快照时交叉核对数据集占用合计与未决预占之和、
   `Spent + Reserved ≤ Total`、以及审计轨迹（每个批次恰有一条 reserve
   事件和至多一条终态事件，金额一致）；任何不一致都显式返回
@@ -163,7 +185,8 @@ reserve ──► reserved ──► confirmed   （actualEps 入 Spent，差额
 | `version_incompatible` | 快照版本高于当前支持版本 |
 | `corrupt_snapshot` | 快照无法解析或内部不一致（占用合计、状态机、审计轨迹对不上） |
 | `batch_not_found` | confirm/release/get 指向不存在的批次 |
-| `invalid_state` | 对已结算（confirmed/released/expired）批次再次 confirm/release |
+| `invalid_state` | 对**未到期但已结算**（confirmed/released）批次再次 confirm/release |
+| `reservation_expired` | 批次已过 `ExpiresAt`：过期之后 confirm/release 一律拒绝（无论是否跑过回收扫描），与不存在、非法状态、超额明确区分 |
 
 ## 序列化与兼容范围
 
@@ -203,6 +226,20 @@ go test ./dpengine/ -v            # 查看每个用例的输入与判定依据�
   20 笔成功、占用恰为 10；重复 BatchID 的并发预占只占用一次。
 - **过期回收**：固定时钟下 t+30s 不回收、截止时刻精确回收、重复扫描
   幂等、已结算批次不被回收、回收额度可重新预占，并生成可审计事件。
+- **截止时间为唯一过期判据**：不跑任何扫描，过期后的 confirm/release 同样
+  被拒（`reservation_expired`），且与“先扫描后结算”分支的最终状态完全一致；
+  到期前 1 秒仍可结算、到期时刻即拒；`batch_not_found`/`invalid_state`/
+  `reservation_expired`/`budget_exhausted` 四类失败互不混淆。
+- **无人回收也能复用过期额度**：不调用扫描时，新的预占与直接扣费都会在
+  需要额度时惰性收回过期持有额并立即使用；`Budget` 视图把未到期占用
+  （`Reserved`）与已过期待回收（`Releasable/Expired`）分开列示，且
+  `Spent + Reserved ≤ Total` 恒成立。
+- **并发撞车只生效一次**：8 轮 × 32 goroutine 的“截止前确认 vs 截止时
+  回收”竞争、64 路重复 confirm/release（含混发），断言终态效果恰有一次、
+  同一批次不会既计费又退额；全部在 `-race` 下通过。
+- **重启后仍按截止时间判定**：保存时未到期、重启时已过期的批次无需任何
+  扫描即被拒结算，其额度被新预占惰性复用，审计轨迹恰有一条 expire 事件，
+  再次重启不重复回收。
 - **重启恢复**：未决预占多轮快照往返后仍有效且只能结算一次、截止时间
   原样保留、恢复后仍能挡住抢占请求并按原规则过期回收；已结算批次、
   已用额度与审计事件顺序完整保留；v1/v0 旧快照默认加载、消耗不清零。

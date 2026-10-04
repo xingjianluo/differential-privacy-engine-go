@@ -15,6 +15,10 @@ const (
 	ReasonCorruptSnapshot  Reason = "corrupt_snapshot"
 	ReasonBatchNotFound    Reason = "batch_not_found"
 	ReasonInvalidState     Reason = "invalid_state"
+	// ReasonReservationExpired: the batch's hold deadline (ExpiresAt) has
+	// passed. The deadline alone decides this: whether or not an explicit
+	// expiry sweep happened to run is irrelevant.
+	ReasonReservationExpired Reason = "reservation_expired"
 )
 
 // Error is the single error type returned by the engine. Reason is always
