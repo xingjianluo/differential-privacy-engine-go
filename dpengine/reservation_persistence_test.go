@@ -40,11 +40,14 @@ func TestSnapshotRestoresOpenReservation(t *testing.T) {
 	}
 
 	r := snapshotRoundTrip(t, l)
+	// Pin the restored clock to just after the crash so the open hold is
+	// still within its (base+5m) deadline.
+	r.now = func() time.Time { return base.Add(time.Minute) }
 
 	view, _ := r.Budget("ds")
-	t.Logf("input: restart with spent=2 open=3 confirmed(done=.5) -> spent=%.1f reserved=%.1f available=%.1f",
-		view.Spent, view.Reserved, view.Available)
-	if !approx(view.Spent, 2.5) || !approx(view.Reserved, 3) || !approx(view.Available, 4.5) {
+	t.Logf("input: restart with spent=2 open=3 confirmed(done=.5) -> spent=%.1f reserved=%.1f expired=%.1f available=%.1f",
+		view.Spent, view.Reserved, view.Expired, view.Available)
+	if !approx(view.Spent, 2.5) || !approx(view.Reserved, 3) || !approx(view.Expired, 0) || !approx(view.Available, 4.5) {
 		t.Fatalf("budget view after restart wrong: %+v", view)
 	}
 

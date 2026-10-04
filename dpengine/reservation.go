@@ -56,26 +56,46 @@ type BatchEvent struct {
 //
 //	Total      = configured total epsilon
 //	Spent      = settled consumption (monotonic, never decreases)
-//	Reserved   = epsilon held by open reservations, unavailable to others
-//	Releasable = reserved minus the minimum already-earmarked portion;
-//	             under pure holds this is the full Reserved amount, all
-//	             reclaimable when open batches are cancelled or expire
-//	Available  = Total - Spent - Reserved, immediately grantable now
+//	Reserved   = epsilon held by open reservations whose deadline has not
+//	             yet passed; unavailable to other requests
+//	Expired    = epsilon held by reservations whose deadline has passed but
+//	             which have not been reclaimed yet; logically dead and
+//	             reclaimable on demand (explicit sweep or the next
+//	             reserve/consume that needs room)
+//	Releasable = Reserved + Expired: every epsilon currently parked in a
+//	             hold that can come back via release, deadline expiry or a
+//	             reclaim sweep. It is a breakdown annotation, not an
+//	             additional partition.
+//	Available  = Total - Spent - Reserved - Expired as of the last
+//	             reclaim: the amount grantable without triggering a
+//	             reclaim. The Expired portion becomes usable immediately
+//	             with the next reserve/consume that needs it (or an
+//	             explicit ExpireReservations call).
 //
-// Invariant: Spent + Reserved <= Total always holds.
+// Invariants at all times:
+//
+//	Spent + Reserved + Expired <= Total
+//	Spent + Reserved             <= Total   (a batch past its deadline can
+//	                                          never be settled any more, so
+//	                                          expired holds never turn into
+//	                                          spent)
 type BudgetView struct {
 	Dataset    string
 	Total      float64
 	Spent      float64
 	Reserved   float64
+	Expired    float64
 	Releasable float64
 	Available  float64
 }
 
 // Reserve holds epsilon for a batch. The hold is immediately unavailable
 // to other requests. It must later be settled exactly once via Confirm or
-// Release (or is reclaimed by an expiry sweep); replaying a batchID that
-// already exists returns its current state unchanged.
+// Release before its deadline; after the deadline it can no longer be
+// settled and is reclaimed (explicitly via ExpireReservations, or on demand
+// when a later reserve/consume needs the room). Replaying a batchID that
+// already exists returns its current state unchanged and never charges the
+// hold twice.
 func (l *Ledger) Reserve(dataset, batchID string, epsilon float64, ttl time.Duration) (Reservation, error) {
 	if batchID == "" {
 		return Reservation{}, newError(ReasonInvalidParameter, "batch id must not be empty")
@@ -91,6 +111,14 @@ func (l *Ledger) Reserve(dataset, batchID string, epsilon float64, ttl time.Dura
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	now := l.now()
+	// Deadline is the sole expiry authority: before granting anything,
+	// reclaim every hold whose deadline has passed — whether or not an
+	// explicit sweep ever ran — so dead holds cannot pin the budget. The
+	// reclaim is serialized here, so it can never race a settlement into a
+	// double effect.
+	l.reclaimDue(now)
 
 	// Idempotent replay of the whole lifecycle: an existing batch is
 	// never re-charged nor reset.
@@ -109,7 +137,6 @@ func (l *Ledger) Reserve(dataset, batchID string, epsilon float64, ttl time.Dura
 				ds.SpentEpsilon, ds.ReservedEpsilon, ds.TotalEpsilon))
 	}
 
-	now := l.now()
 	r := &Reservation{
 		BatchID:     batchID,
 		Dataset:     dataset,
@@ -129,8 +156,13 @@ func (l *Ledger) Reserve(dataset, batchID string, epsilon float64, ttl time.Dura
 
 // Confirm settles a reservation: actualEps becomes settled Spent (must not
 // exceed the hold), and the unused remainder of the hold is freed. Confirm
-// is effective exactly once per batch; a second confirm/release after
-// settlement fails with ReasonInvalidState.
+// is effective exactly once per batch.
+//
+// The deadline is the sole expiry authority: a batch whose ExpiresAt has
+// passed can no longer be confirmed, regardless of whether an expiry sweep
+// has run, and fails with ReasonReservationExpired. A second
+// confirm/release after settlement fails with ReasonInvalidState; an
+// unknown batch fails with ReasonBatchNotFound.
 func (l *Ledger) Confirm(batchID string, actualEps float64) (Reservation, error) {
 	if actualEps < 0 || math.IsNaN(actualEps) || math.IsInf(actualEps, 0) {
 		return Reservation{}, newError(ReasonInvalidParameter,
@@ -143,6 +175,11 @@ func (l *Ledger) Confirm(batchID string, actualEps float64) (Reservation, error)
 	r, ok := l.reservations[batchID]
 	if !ok {
 		return Reservation{}, newError(ReasonBatchNotFound, "no such batch: "+batchID)
+	}
+	if r.Status == ReservationReserved && !r.ExpiresAt.After(l.now()) {
+		return Reservation{}, newError(ReasonReservationExpired,
+			fmt.Sprintf("batch %q passed its deadline at %v and can no longer be confirmed",
+				batchID, r.ExpiresAt))
 	}
 	if r.Status != ReservationReserved {
 		return Reservation{}, newError(ReasonInvalidState,
@@ -175,8 +212,10 @@ func (l *Ledger) Confirm(batchID string, actualEps float64) (Reservation, error)
 }
 
 // Release cancels a reservation and frees the entire hold without charging
-// any consumption. Effective exactly once per batch; releasing an already
-// settled batch fails with ReasonInvalidState.
+// any consumption. Effective exactly once per batch. Releasing a batch
+// whose deadline has passed fails with ReasonReservationExpired (it can
+// only be reclaimed); releasing an already settled batch fails with
+// ReasonInvalidState; an unknown batch fails with ReasonBatchNotFound.
 func (l *Ledger) Release(batchID string) (Reservation, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -184,6 +223,11 @@ func (l *Ledger) Release(batchID string) (Reservation, error) {
 	r, ok := l.reservations[batchID]
 	if !ok {
 		return Reservation{}, newError(ReasonBatchNotFound, "no such batch: "+batchID)
+	}
+	if r.Status == ReservationReserved && !r.ExpiresAt.After(l.now()) {
+		return Reservation{}, newError(ReasonReservationExpired,
+			fmt.Sprintf("batch %q passed its deadline at %v and can no longer be released",
+				batchID, r.ExpiresAt))
 	}
 	if r.Status != ReservationReserved {
 		return Reservation{}, newError(ReasonInvalidState,
@@ -209,14 +253,28 @@ func (l *Ledger) Release(batchID string) (Reservation, error) {
 // according to the ledger clock: the full hold is returned to the available
 // pool and the batch becomes ReservationExpired (terminal). Recovery is
 // deterministic and auditable — batches are reclaimed in BatchID order and
-// each reclaim appends an expiry event. Already-settled batches are never
-// touched. The reclaimed reservations are returned; an empty slice means
-// nothing was due.
+// each reclaim appends an expiry event. Already-settled or already-reclaimed
+// batches are never touched, so repeated sweeps are idempotent and a hold is
+// returned to the pool at most once. The reclaimed reservations are
+// returned; an empty slice means nothing was due.
+//
+// Calling this method is optional: deadline-due holds are also reclaimed on
+// demand by the next Reserve/Consume that could use the room, and can never
+// be confirmed or released past their deadline even if no sweep ever runs.
 func (l *Ledger) ExpireReservations() ([]Reservation, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.reclaimDue(l.now()), nil
+}
 
-	now := l.now()
+// reclaimDue transitions every still-open reservation whose deadline is not
+// after now into the terminal expired state, returns its full hold to the
+// dataset pool and appends one expiry event per batch, in BatchID order.
+// Callers must hold l.mu. Because reclaimDue runs under the same mutex as
+// Confirm/Release, a batch can be settled OR reclaimed, never both — the
+// deadline check in Confirm/Release guarantees an expired hold never turns
+// into spent, and the single status flip guarantees the hold is freed once.
+func (l *Ledger) reclaimDue(now time.Time) []Reservation {
 	var ids []string
 	for id, r := range l.reservations {
 		if r.Status == ReservationReserved && !r.ExpiresAt.After(now) {
@@ -241,7 +299,7 @@ func (l *Ledger) ExpireReservations() ([]Reservation, error) {
 		})
 		reclaimed = append(reclaimed, *r)
 	}
-	return reclaimed, nil
+	return reclaimed
 }
 
 // GetReservation returns a copy of one reservation.
@@ -255,7 +313,10 @@ func (l *Ledger) GetReservation(batchID string) (Reservation, error) {
 	return *r, nil
 }
 
-// Budget returns the spent / reserved / releasable / available breakdown.
+// Budget returns the spent / reserved / expired / releasable / available
+// breakdown at one consistent instant. Holds whose deadline has passed but
+// which have not been reclaimed yet are reported as Expired (not Reserved),
+// even when no explicit sweep has happened.
 func (l *Ledger) Budget(dataset string) (BudgetView, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -263,8 +324,19 @@ func (l *Ledger) Budget(dataset string) (BudgetView, error) {
 	if !ok {
 		return BudgetView{}, newError(ReasonDatasetNotFound, "no such dataset: "+dataset)
 	}
-	reserved := ds.ReservedEpsilon
-	available := ds.TotalEpsilon - ds.SpentEpsilon - reserved
+	now := l.now()
+	var reserved, expired float64
+	for _, r := range l.reservations {
+		if r.Dataset != dataset || r.Status != ReservationReserved {
+			continue
+		}
+		if r.ExpiresAt.After(now) {
+			reserved += r.ReservedEps
+		} else {
+			expired += r.ReservedEps
+		}
+	}
+	available := ds.TotalEpsilon - ds.SpentEpsilon - reserved - expired
 	if available < 0 && available > -epsilonTolerance {
 		available = 0
 	}
@@ -273,7 +345,8 @@ func (l *Ledger) Budget(dataset string) (BudgetView, error) {
 		Total:      ds.TotalEpsilon,
 		Spent:      ds.SpentEpsilon,
 		Reserved:   reserved,
-		Releasable: reserved,
+		Expired:    expired,
+		Releasable: reserved + expired,
 		Available:  available,
 	}, nil
 }

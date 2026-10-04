@@ -7,14 +7,15 @@ package dpengine
 type Reason string
 
 const (
-	ReasonDatasetNotFound  Reason = "dataset_not_found"
-	ReasonInvalidParameter Reason = "invalid_parameter"
-	ReasonBudgetExhausted  Reason = "budget_exhausted"
-	ReasonUnboundedInput   Reason = "unbounded_input"
-	ReasonVersionMismatch  Reason = "version_incompatible"
-	ReasonCorruptSnapshot  Reason = "corrupt_snapshot"
-	ReasonBatchNotFound    Reason = "batch_not_found"
-	ReasonInvalidState     Reason = "invalid_state"
+	ReasonDatasetNotFound    Reason = "dataset_not_found"
+	ReasonInvalidParameter   Reason = "invalid_parameter"
+	ReasonBudgetExhausted    Reason = "budget_exhausted"
+	ReasonUnboundedInput     Reason = "unbounded_input"
+	ReasonVersionMismatch    Reason = "version_incompatible"
+	ReasonCorruptSnapshot    Reason = "corrupt_snapshot"
+	ReasonBatchNotFound      Reason = "batch_not_found"
+	ReasonInvalidState       Reason = "invalid_state"
+	ReasonReservationExpired Reason = "reservation_expired"
 )
 
 // Error is the single error type returned by the engine. Reason is always

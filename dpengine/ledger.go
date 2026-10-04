@@ -116,6 +116,13 @@ func (l *Ledger) Consume(dataset, requestID string, epsilon float64, comp Compos
 		return Consumption{}, newError(ReasonDatasetNotFound, "no such dataset: "+dataset)
 	}
 
+	// Deadline is the sole expiry authority: reclaim holds whose deadline
+	// has passed even if nobody ran an explicit sweep, so long-sleeping
+	// batches can never pin the budget. reclaimDue never touches settled
+	// batches and flips each batch at most once, so a hold is charged or
+	// returned exactly once.
+	l.reclaimDue(l.now())
+
 	var newSpent float64
 	switch comp {
 	case SequentialComposition:
